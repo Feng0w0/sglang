@@ -179,7 +179,10 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.prefill_consistency_dfx import trace_sglang_prefill_hidden
+from sglang.srt.prefill_consistency_dfx import (
+    should_trace_layer_detail,
+    trace_sglang_prefill_hidden,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -2865,6 +2868,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch.input_ids,
             forward_batch,
         )
+        trace_layer_detail = should_trace_layer_detail(self.layer_id)
+        if trace_layer_detail:
+            trace_sglang_prefill_hidden(
+                f"layer.{self.layer_id}.input_norm",
+                hidden_states,
+                forward_batch.input_ids,
+                forward_batch,
+            )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -2895,6 +2906,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if trace_layer_detail:
+            # These tensors are captured after the attention TP reduction and
+            # residual add.  Unlike the raw attention projection, they remain
+            # comparable when SGLang and Megatron use different TP sizes.
+            trace_sglang_prefill_hidden(
+                f"layer.{self.layer_id}.attention_residual",
+                residual,
+                forward_batch.input_ids,
+                forward_batch,
+            )
+            trace_sglang_prefill_hidden(
+                f"layer.{self.layer_id}.post_attention_norm",
+                hidden_states,
+                forward_batch.input_ids,
+                forward_batch,
+            )
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(

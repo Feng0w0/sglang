@@ -24,6 +24,27 @@ def _enabled() -> bool:
     return os.environ.get("GLM52_DFX_PREFILL") == "1"
 
 
+def should_trace_layer_detail(layer_id: int) -> bool:
+    """Return whether stable internal boundaries should be traced for a layer."""
+
+    if not _enabled() or os.environ.get("GLM52_DFX_LAYER_DETAIL") != "1":
+        return False
+    selected = os.environ.get("GLM52_DFX_LAYER_DETAIL_LAYERS", "0").strip().lower()
+    if selected in {"all", "*"}:
+        return True
+    for item in selected.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if int(start) <= layer_id <= int(end):
+                return True
+        elif int(item) == layer_id:
+            return True
+    return False
+
+
 def _tp_rank() -> int:
     try:
         from sglang.srt.distributed.parallel_state import (
