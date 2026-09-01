@@ -179,6 +179,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.prefill_consistency_dfx import trace_sglang_prefill_hidden
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -2858,6 +2859,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=self._resolve_gfx95_quant_format(),
             )
         )
+        trace_sglang_prefill_hidden(
+            "embedding" if self.layer_id == 0 else f"layer.{self.layer_id - 1}",
+            residual,
+            forward_batch.input_ids,
+            forward_batch,
+        )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -3312,9 +3319,21 @@ class DeepseekV2Model(nn.Module):
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
+                    last_layer_residual = hidden_states
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, last_layer_residual = self.norm(
+                        hidden_states, residual
+                    )
+                trace_sglang_prefill_hidden(
+                    f"layer.{self.config.num_hidden_layers - 1}",
+                    last_layer_residual,
+                    input_ids,
+                    forward_batch,
+                )
+                trace_sglang_prefill_hidden(
+                    "final_norm", hidden_states, input_ids, forward_batch
+                )
 
         if self.pp_group.is_last_rank and use_cp_v1:
             # allgather + rerrange
