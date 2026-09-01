@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.prefill_consistency_dfx import trace_sglang_attention_detail
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache_finalize,
     cp_all_gather_rerange_kv_cache_launch,
@@ -614,6 +615,18 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "q_down",
+            fused_qkv_a_proj_out[..., : m.q_lora_rank],
+            forward_batch,
+        )
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "kv_down",
+            fused_qkv_a_proj_out[..., m.q_lora_rank :],
+            forward_batch,
+        )
         if m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
@@ -678,6 +691,14 @@ def forward_dsa_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
+        trace_sglang_attention_detail(
+            m.layer_id, "q_norm", q_lora, forward_batch
+        )
+        trace_sglang_attention_detail(
+            m.layer_id, "kv_norm", k_nope, forward_batch
+        )
+        trace_sglang_attention_detail(m.layer_id, "q_up", q, forward_batch)
+
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
@@ -695,6 +716,9 @@ def forward_dsa_prepare_npu(
                     positions,
                 )
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+        trace_sglang_attention_detail(m.layer_id, "q_rope", q_pe, forward_batch)
+        trace_sglang_attention_detail(m.layer_id, "k_rope", k_pe, forward_batch)
 
         if dsa_use_prefill_cp(forward_batch):
             latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
@@ -717,6 +741,10 @@ def forward_dsa_prepare_npu(
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
             q_nope_out = q_nope_out.transpose(0, 1)
 
+    trace_sglang_attention_detail(
+        m.layer_id, "q_absorbed", q_nope_out, forward_batch
+    )
+
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -729,6 +757,9 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
+    trace_sglang_attention_detail(
+        m.layer_id, "topk_indices", topk_indices, forward_batch
+    )
     if cp_handle is not None:
         cp_handle.wait()
         latent_cache_output = cp_all_gather_rerange_kv_cache_finalize(
@@ -773,6 +804,9 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
+    trace_sglang_attention_detail(
+        m.layer_id, "core_out", attn_output, forward_batch
+    )
 
     attn_bmm_output = torch.empty(
         (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
@@ -815,6 +849,10 @@ def forward_dsa_core_npu(
                 perm_x2=(0, 1, 2),
                 perm_y=(1, 0, 2),
             )
+
+    trace_sglang_attention_detail(
+        m.layer_id, "value_mix", attn_bmm_output, forward_batch
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

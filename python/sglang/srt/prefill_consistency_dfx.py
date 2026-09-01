@@ -45,6 +45,32 @@ def should_trace_layer_detail(layer_id: int) -> bool:
     return False
 
 
+def should_trace_attention_detail(layer_id: int) -> bool:
+    """Return whether TP-local attention intermediates should be traced."""
+
+    if not should_trace_layer_detail(layer_id):
+        return False
+    if os.environ.get("GLM52_DFX_ATTN_DETAIL") != "1":
+        return False
+    selected = os.environ.get(
+        "GLM52_DFX_ATTN_DETAIL_LAYERS",
+        os.environ.get("GLM52_DFX_LAYER_DETAIL_LAYERS", "0"),
+    ).strip().lower()
+    if selected in {"all", "*"}:
+        return True
+    for item in selected.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if int(start) <= layer_id <= int(end):
+                return True
+        elif int(item) == layer_id:
+            return True
+    return False
+
+
 def _tp_rank() -> int:
     try:
         from sglang.srt.distributed.parallel_state import (
@@ -54,6 +80,17 @@ def _tp_rank() -> int:
         return get_tensor_model_parallel_rank()
     except Exception:
         return int(os.environ.get("RANK", "0"))
+
+
+def _tp_size() -> int:
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+
+        return get_tensor_model_parallel_world_size()
+    except Exception:
+        return int(os.environ.get("WORLD_SIZE", "1"))
 
 
 def _sequence_slices(input_ids: torch.Tensor, forward_batch):
@@ -145,6 +182,25 @@ def trace_sglang_prefill_hidden(
             "finite": bool(torch.isfinite(vector).all().item()),
             "abs_max": float(torch.nan_to_num(vector).abs().max().item()),
             "tp_rank": 0,
+            "tp_size": _tp_size(),
         }
         _EMITTED[boundary] += 1
         print(_MARKER + json.dumps(event, separators=(",", ":")), flush=True)
+
+
+def trace_sglang_attention_detail(
+    layer_id: int,
+    suffix: str,
+    tensor: torch.Tensor,
+    forward_batch,
+) -> None:
+    """Trace one TP-local attention boundary when both backends use equal TP."""
+
+    if not should_trace_attention_detail(layer_id):
+        return
+    trace_sglang_prefill_hidden(
+        f"layer.{layer_id}.attn.{suffix}",
+        tensor,
+        forward_batch.input_ids,
+        forward_batch,
+    )
