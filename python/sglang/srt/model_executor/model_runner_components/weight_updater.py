@@ -379,6 +379,10 @@ class WeightUpdater:
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
+        reconstructed_tensors = [
+            (name, tensor.clone()) for name, tensor in reconstructed_tensors
+        ]
+
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
 
