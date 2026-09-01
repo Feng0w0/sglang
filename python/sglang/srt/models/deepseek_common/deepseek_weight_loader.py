@@ -23,6 +23,7 @@ import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.consistency_dfx import emit_weight_tensor
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -92,19 +93,83 @@ def _run_weight_loader_with_context(
     if loader_kwargs is None:
         loader_kwargs = {}
 
+    loader_owner = getattr(weight_loader, "__self__", None)
+    owner_name = type(loader_owner).__name__ if loader_owner is not None else "<function>"
+    tp_rank = getattr(loader_owner, "tp_rank", None)
+    tp_size = getattr(loader_owner, "tp_size", None)
+    output_dim = getattr(param, "output_dim", None)
+    input_dim = getattr(param, "input_dim", None)
+
+    # ``sglang_loader_input`` must match the Megatron/source and bucket events
+    # for this checkpoint name.  ``sglang_param_after_load`` is intentionally
+    # separate: packed QKV/MoE parameters can be updated in several calls, so
+    # its sequence shows exactly which partial write first changed the target.
+    emit_weight_tensor(
+        stage="sglang_loader_input",
+        name=checkpoint_name,
+        tensor=loaded_weight,
+        parameter_name=parameter_name,
+        loader_owner=owner_name,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        output_dim=output_dim,
+        input_dim=input_dim,
+        loader_args=repr(loader_args),
+        loader_kwargs=repr(loader_kwargs),
+    )
+
     try:
-        return weight_loader(param, loaded_weight, *loader_args, **loader_kwargs)
-    except Exception as exc:
-        loader_owner = getattr(weight_loader, "__self__", None)
-        owner_name = (
-            type(loader_owner).__name__ if loader_owner is not None else "<function>"
+        result = weight_loader(param, loaded_weight, *loader_args, **loader_kwargs)
+        if (
+            get_bool_env_var("GLM52_DFX_VERIFY_TP_SLICE", "false")
+            and isinstance(output_dim, int)
+            and isinstance(tp_rank, int)
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and loaded_weight.ndim == param.ndim
+            and 0 <= output_dim < param.ndim
+            and loaded_weight.shape[output_dim] == param.shape[output_dim] * tp_size
+            and all(
+                loaded_weight.shape[dim] == param.shape[dim]
+                for dim in range(param.ndim)
+                if dim != output_dim
+            )
+        ):
+            expected = loaded_weight.narrow(
+                output_dim,
+                tp_rank * param.shape[output_dim],
+                param.shape[output_dim],
+            ).to(dtype=param.dtype)
+            emit_weight_tensor(
+                stage="sglang_expected_tp_slice",
+                name=parameter_name,
+                tensor=expected,
+                checkpoint_name=checkpoint_name,
+                loader_owner=owner_name,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                output_dim=output_dim,
+                input_dim=input_dim,
+                loader_args=repr(loader_args),
+                loader_kwargs=repr(loader_kwargs),
+            )
+        emit_weight_tensor(
+            stage="sglang_param_after_load",
+            name=parameter_name,
+            tensor=param,
+            checkpoint_name=checkpoint_name,
+            loader_owner=owner_name,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            output_dim=output_dim,
+            input_dim=input_dim,
+            loader_args=repr(loader_args),
+            loader_kwargs=repr(loader_kwargs),
         )
-        tp_rank = getattr(loader_owner, "tp_rank", None)
-        tp_size = getattr(loader_owner, "tp_size", None)
+        return result
+    except Exception as exc:
         scheme = getattr(loader_owner, "scheme", None)
         quant_method = getattr(loader_owner, "quant_method", None)
-        output_dim = getattr(param, "output_dim", None)
-        input_dim = getattr(param, "input_dim", None)
         raise RuntimeError(
             "Failed to load checkpoint tensor "
             f"{checkpoint_name!r} into parameter {parameter_name!r}; "

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.consistency_dfx import emit_weight_tensor
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -382,6 +383,18 @@ class WeightUpdater:
         reconstructed_tensors = [
             (name, tensor.clone()) for name, tensor in reconstructed_tensors
         ]
+
+        # This is the first SGLang-side boundary after Ray/CUDA-IPC
+        # deserialization and flattened-bucket reconstruction.  Comparing this
+        # fingerprint with ``megatron_hf_before_send`` distinguishes transport
+        # corruption from a later TP slicing/weight-loader problem.
+        for name, tensor in reconstructed_tensors:
+            emit_weight_tensor(
+                stage="sglang_bucket_received",
+                name=name,
+                tensor=tensor,
+                tp_rank=self.tp_rank,
+            )
 
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
