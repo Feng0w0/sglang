@@ -22,7 +22,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.prefill_consistency_dfx import trace_sglang_attention_detail
+from sglang.srt.prefill_consistency_dfx import (
+    should_trace_attention_detail,
+    trace_sglang_attention_detail,
+)
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache_finalize,
     cp_all_gather_rerange_kv_cache_launch,
@@ -66,6 +69,103 @@ def _trace_dsa_rope_reference(
     trace_sglang_attention_detail(m.layer_id, "rope_sin", sin, forward_batch)
 
 
+def _interleave_half_rope_reference(
+    tensor: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Pure-Torch reference for Ascend ``npu_interleave_rope``."""
+
+    half_layout = torch.cat((tensor[..., 0::2], tensor[..., 1::2]), dim=-1)
+    first, second = half_layout.chunk(2, dim=-1)
+    rotated = torch.cat((-second, first), dim=-1)
+    runtime_cos = cos.reshape(cos.shape[0], -1, cos.shape[-1])
+    runtime_sin = sin.reshape(sin.shape[0], -1, sin.shape[-1])
+    return half_layout * runtime_cos + rotated * runtime_sin
+
+
+def _interleaved_to_half_layout(tensor: torch.Tensor) -> torch.Tensor:
+    """Canonicalize GPT-J adjacent-pair output to Megatron MLA half layout."""
+
+    return torch.cat((tensor[..., 0::2], tensor[..., 1::2]), dim=-1)
+
+
+def _generic_rope_reference(
+    tensor: torch.Tensor,
+    cos_sin: torch.Tensor,
+    *,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    """Pure-Torch reference for SGLang's generic RotaryEmbedding path."""
+
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    cos = cos.unsqueeze(-2).to(tensor.dtype)
+    sin = sin.unsqueeze(-2).to(tensor.dtype)
+    if is_neox_style:
+        first, second = tensor.chunk(2, dim=-1)
+        return torch.cat(
+            (first * cos - second * sin, second * cos + first * sin), dim=-1
+        )
+    first = tensor[..., 0::2]
+    second = tensor[..., 1::2]
+    return torch.stack(
+        (first * cos - second * sin, second * cos + first * sin), dim=-1
+    ).flatten(-2)
+
+
+def _trace_generic_dsa_rope_reference(
+    m: "DeepseekV2AttentionMLA",
+    cos_sin: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Trace the non-MLAPO RoPE operands and canonical software reference."""
+
+    if not should_trace_attention_detail(m.layer_id):
+        return None
+
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    runtime_cos = torch.cat((cos, cos), dim=-1).unsqueeze(1).unsqueeze(1)
+    runtime_sin = torch.cat((sin, sin), dim=-1).unsqueeze(1).unsqueeze(1)
+    trace_sglang_attention_detail(
+        m.layer_id, "rope_runtime_cos", runtime_cos, forward_batch
+    )
+    trace_sglang_attention_detail(
+        m.layer_id, "rope_runtime_sin", runtime_sin, forward_batch
+    )
+
+    q_reference = _generic_rope_reference(
+        q_pe, cos_sin, is_neox_style=m.rotary_emb.is_neox_style
+    )
+    k_reference = _generic_rope_reference(
+        k_pe, cos_sin, is_neox_style=m.rotary_emb.is_neox_style
+    )
+    if not m.rotary_emb.is_neox_style:
+        q_reference = _interleaved_to_half_layout(q_reference)
+        k_reference = _interleaved_to_half_layout(k_reference)
+
+    trace_sglang_attention_detail(
+        m.layer_id, "q_rope_software_ref", q_reference, forward_batch
+    )
+    trace_sglang_attention_detail(
+        m.layer_id, "k_rope_software_ref", k_reference, forward_batch
+    )
+    trace_sglang_attention_detail(
+        m.layer_id,
+        "q_rope_sglang_ref_vs_megatron",
+        q_reference,
+        forward_batch,
+    )
+    trace_sglang_attention_detail(
+        m.layer_id,
+        "k_rope_sglang_ref_vs_megatron",
+        k_reference,
+        forward_batch,
+    )
+    return q_reference, k_reference
+
+
 def _apply_dsa_interleave_half_rope(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -91,6 +191,37 @@ def _apply_dsa_interleave_half_rope(
 
     q_shape = q_pe.shape
     k_shape = k_pe.shape
+    q_reference = None
+    k_reference = None
+    if should_trace_attention_detail(m.layer_id):
+        trace_sglang_attention_detail(
+            m.layer_id, "rope_runtime_cos", cos, forward_batch
+        )
+        trace_sglang_attention_detail(
+            m.layer_id, "rope_runtime_sin", sin, forward_batch
+        )
+        q_reference = _interleave_half_rope_reference(q_pe, cos, sin)
+        k_reference = _interleave_half_rope_reference(k_pe, cos, sin)
+        trace_sglang_attention_detail(
+            m.layer_id, "q_rope_software_ref", q_reference, forward_batch
+        )
+        trace_sglang_attention_detail(
+            m.layer_id, "k_rope_software_ref", k_reference, forward_batch
+        )
+        # The matching Megatron events carry its actual output.  This directly
+        # answers whether Megatron agrees with SGLang's independent reference.
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "q_rope_sglang_ref_vs_megatron",
+            q_reference,
+            forward_batch,
+        )
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "k_rope_sglang_ref_vs_megatron",
+            k_reference,
+            forward_batch,
+        )
     q_pe = torch_npu.npu_interleave_rope(
         q_pe.reshape(q_shape[0], q_shape[1], 1, q_shape[2]),
         cos,
@@ -101,6 +232,20 @@ def _apply_dsa_interleave_half_rope(
         cos,
         sin,
     ).reshape(k_shape)
+    if q_reference is not None:
+        # The matching Megatron events carry its independent software reference.
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "q_rope_npu_vs_megatron_ref",
+            q_pe,
+            forward_batch,
+        )
+        trace_sglang_attention_detail(
+            m.layer_id,
+            "k_rope_npu_vs_megatron_ref",
+            k_pe,
+            forward_batch,
+        )
     return q_pe, k_pe
 
 
@@ -726,6 +871,7 @@ def forward_dsa_prepare_npu(
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
         _trace_dsa_rope_reference(m, positions, q_pe, k_pe, forward_batch)
 
+        canonicalize_rope_trace = False
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(
                 m,
@@ -740,10 +886,43 @@ def forward_dsa_prepare_npu(
                     0,
                     positions,
                 )
+            cos_sin = m.rotary_emb.cos_sin_cache.index_select(0, positions)
+            generic_references = _trace_generic_dsa_rope_reference(
+                m, cos_sin, q_pe, k_pe, forward_batch
+            )
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        trace_sglang_attention_detail(m.layer_id, "q_rope", q_pe, forward_batch)
-        trace_sglang_attention_detail(m.layer_id, "k_rope", k_pe, forward_batch)
+            if generic_references is not None:
+                q_actual = q_pe
+                k_actual = k_pe
+                if not m.rotary_emb.is_neox_style:
+                    q_actual = _interleaved_to_half_layout(q_actual)
+                    k_actual = _interleaved_to_half_layout(k_actual)
+                    canonicalize_rope_trace = True
+                trace_sglang_attention_detail(
+                    m.layer_id,
+                    "q_rope_npu_vs_megatron_ref",
+                    q_actual,
+                    forward_batch,
+                )
+                trace_sglang_attention_detail(
+                    m.layer_id,
+                    "k_rope_npu_vs_megatron_ref",
+                    k_actual,
+                    forward_batch,
+                )
+
+        q_rope_trace = q_pe
+        k_rope_trace = k_pe
+        if canonicalize_rope_trace:
+            q_rope_trace = _interleaved_to_half_layout(q_rope_trace)
+            k_rope_trace = _interleaved_to_half_layout(k_rope_trace)
+        trace_sglang_attention_detail(
+            m.layer_id, "q_rope", q_rope_trace, forward_batch
+        )
+        trace_sglang_attention_detail(
+            m.layer_id, "k_rope", k_rope_trace, forward_batch
+        )
 
         if dsa_use_prefill_cp(forward_batch):
             latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
