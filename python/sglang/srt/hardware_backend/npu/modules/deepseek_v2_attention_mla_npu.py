@@ -42,6 +42,30 @@ def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
     )
 
 
+def _trace_dsa_rope_reference(
+    m: "DeepseekV2AttentionMLA",
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> None:
+    """Emit canonical RoPE inputs and the cos/sin row selected per token."""
+
+    trace_sglang_attention_detail(
+        m.layer_id, "q_rope_input", q_pe, forward_batch
+    )
+    trace_sglang_attention_detail(
+        m.layer_id, "k_rope_input", k_pe, forward_batch
+    )
+    trace_sglang_attention_detail(
+        m.layer_id, "position_ids", positions.reshape(-1, 1), forward_batch
+    )
+    cos_sin = m.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    trace_sglang_attention_detail(m.layer_id, "rope_cos", cos, forward_batch)
+    trace_sglang_attention_detail(m.layer_id, "rope_sin", sin, forward_batch)
+
+
 def _apply_dsa_interleave_half_rope(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -700,6 +724,7 @@ def forward_dsa_prepare_npu(
         trace_sglang_attention_detail(m.layer_id, "q_up", q, forward_batch)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
+        _trace_dsa_rope_reference(m, positions, q_pe, k_pe, forward_batch)
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(

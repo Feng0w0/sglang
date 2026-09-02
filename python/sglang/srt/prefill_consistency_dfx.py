@@ -175,6 +175,8 @@ def trace_sglang_prefill_hidden(
             "response_length": response_length,
             "prediction_position": prediction_position,
             "response_token": int(sequence[-response_length].item()),
+            "tensor_shape": list(hidden_states.shape),
+            "token_layout": "token_first_flatten_remaining",
             "hidden_size": vector.numel(),
             "vector_dtype": "float32",
             "vector_sha256": hashlib.sha256(vector_bytes).hexdigest(),
