@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,6 +44,34 @@ def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
     return m.rotary_emb is not None and vars(m).get(
         "use_explicit_npu_interleaved_rope", False
     )
+
+
+def _apply_dsa_megatron_rope(
+    m: "DeepseekV2AttentionMLA",
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce Megatron MLA's FP32-frequency, half-layout RoPE arithmetic."""
+    rotary_dim = m.qk_rope_head_dim
+    inv_freq = 1.0 / (
+        float(m.rotary_emb.base)
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=q_pe.device)
+            / rotary_dim
+        )
+    )
+    freqs = torch.outer(positions.to(dtype=torch.float32), inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = torch.cos(emb).to(dtype=q_pe.dtype).unsqueeze(1)
+    sin = torch.sin(emb).to(dtype=q_pe.dtype).unsqueeze(1)
+
+    def apply(x: torch.Tensor) -> torch.Tensor:
+        x = torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        return (x * cos) + (torch.cat((-x2, x1), dim=-1) * sin)
+
+    return apply(q_pe), apply(k_pe)
 
 
 def _trace_dsa_rope_reference(
@@ -783,7 +812,19 @@ def forward_dsa_prepare_npu(
             zero_allocator,
         )
     else:
-        fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        if os.environ.get("SLIME_CONSISTENCY_SPLIT_QKV_A_PROJ") == "1":
+            # Megatron executes Q-A and KV-A as separate GEMMs. Preserve that
+            # BF16 rounding boundary in controlled train/infer consistency runs.
+            fused_weight = m.fused_qkv_a_proj_with_mqa.weight
+            q_proj_out = torch.nn.functional.linear(
+                hidden_states, fused_weight[: m.q_lora_rank]
+            )
+            kv_proj_out = torch.nn.functional.linear(
+                hidden_states, fused_weight[m.q_lora_rank :]
+            )
+            fused_qkv_a_proj_out = torch.cat((q_proj_out, kv_proj_out), dim=-1)
+        else:
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         trace_sglang_attention_detail(
             m.layer_id,
             "q_down",
@@ -872,7 +913,9 @@ def forward_dsa_prepare_npu(
         _trace_dsa_rope_reference(m, positions, q_pe, k_pe, forward_batch)
 
         canonicalize_rope_trace = False
-        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+        if os.environ.get("SLIME_CONSISTENCY_MEGATRON_ROPE") == "1":
+            q_pe, k_pe = _apply_dsa_megatron_rope(m, positions, q_pe, k_pe)
+        elif is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(
                 m,
                 positions,
