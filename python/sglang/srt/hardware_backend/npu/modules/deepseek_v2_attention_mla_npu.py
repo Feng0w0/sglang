@@ -1004,6 +1004,32 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
+    if (
+        topk_indices is not None
+        and os.environ.get("SLIME_CONSISTENCY_CANONICAL_INDICES") == "1"
+    ):
+        # Canonicalize valid ids while preserving the NPU sparse-attention
+        # contract that -1 padding stays at the tail.
+        invalid_sentinel = torch.iinfo(topk_indices.dtype).max
+        topk_indices = torch.where(
+            topk_indices >= 0,
+            topk_indices,
+            invalid_sentinel,
+        )
+        topk_indices = torch.sort(topk_indices, dim=-1).values
+        topk_indices = topk_indices.masked_fill(
+            topk_indices == invalid_sentinel,
+            -1,
+        ).contiguous()
+        # Megatron returns min(index_topk, sequence_length) columns. Once the
+        # ids are valid-first, trimming SGLang's fixed-width NPU result is safe.
+        trace_lengths = forward_batch.extend_seq_lens_cpu
+        if trace_lengths:
+            valid_width = min(
+                max(int(length) for length in trace_lengths),
+                topk_indices.shape[-1],
+            )
+            topk_indices = topk_indices[..., :valid_width].contiguous()
     trace_sglang_attention_detail(
         m.layer_id, "topk_indices", topk_indices, forward_batch
     )

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -110,7 +111,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopK,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -1255,6 +1261,7 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        consistency_scale_in_topk = False
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1286,6 +1293,20 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
+            # Megatron applies routed_scaling_factor to FP32 routing weights
+            # before expert combination. Match that rounding order instead of
+            # scaling the combined BF16 expert output on the NPU path.
+            consistency_scale_in_topk = (
+                os.environ.get("SLIME_CONSISTENCY_ROUTER_SCALE_IN_TOPK", "0")
+                == "1"
+                and isinstance(topk_output, StandardTopKOutput)
+            )
+            if consistency_scale_in_topk:
+                topk_output = StandardTopKOutput(
+                    topk_output.topk_weights * self.routed_scaling_factor,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                )
         else:
             pre_quant_input = None
             shared_output = None
@@ -1340,7 +1361,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and not consistency_scale_in_topk:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
